@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
 from torchvision import transforms
 from PIL import Image
 import numpy as np
@@ -223,10 +223,15 @@ class PilotNet(nn.Module):
         )
         self.classifier = nn.Sequential(
             nn.Linear(1152, 100),
+            nn.BatchNorm1d(100),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
             nn.Linear(100, 50),
+            nn.BatchNorm1d(50),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
             nn.Linear(50, 10),
+            nn.BatchNorm1d(10),
             nn.ReLU(inplace=True),
             nn.Linear(10, 2),  # Steering, Speed(정규화)
         )
@@ -257,37 +262,64 @@ def main():
         print(f"[오류] {DATA_ROOT} 안에 dataset.csv 파일이 없습니다!")
         return
 
-    datasets = []
-    for csv_file in csv_files:
+    # 1. Scene-based Split (방지: Data Leakage)
+    # 이미지 프레임 단위가 아닌, 주행 시나리오(폴더/CSV) 단위로 섞어서 분할합니다.
+    random.shuffle(csv_files)
+    num_val_scenes = max(1, int(len(csv_files) * 0.15)) # 최소 1개의 시퀀스는 Validation으로 할당
+    
+    val_csv_files = csv_files[:num_val_scenes]
+    train_csv_files = csv_files[num_val_scenes:]
+
+    print(f"총 {len(csv_files)}개의 주행 시퀀스 중 Train: {len(train_csv_files)}개, Validation: {len(val_csv_files)}개로 분할합니다.")
+
+    train_datasets = []
+    for csv_file in train_csv_files:
         bag_dir = os.path.dirname(csv_file)
         cam1_dir = os.path.join(bag_dir, 'images', 'cam1')
         cam2_dir = os.path.join(bag_dir, 'images', 'cam2')
-        print(f"  데이터셋 로드: {csv_file} ({len(pd.read_csv(csv_file))}개)")
-        datasets.append(FSDSDataset(csv_file=csv_file, cam1_dir=cam1_dir, cam2_dir=cam2_dir, transform=transform))
+        train_datasets.append(FSDSDataset(csv_file=csv_file, cam1_dir=cam1_dir, cam2_dir=cam2_dir, transform=transform))
 
-    combined_dataset = ConcatDataset(datasets)
-    dataloader = DataLoader(combined_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    val_datasets = []
+    for csv_file in val_csv_files:
+        bag_dir = os.path.dirname(csv_file)
+        cam1_dir = os.path.join(bag_dir, 'images', 'cam1')
+        cam2_dir = os.path.join(bag_dir, 'images', 'cam2')
+        val_datasets.append(FSDSDataset(csv_file=csv_file, cam1_dir=cam1_dir, cam2_dir=cam2_dir, transform=transform))
+
+    train_dataset = ConcatDataset(train_datasets)
+    val_dataset = ConcatDataset(val_datasets)
+    
+    train_size = len(train_dataset)
+    val_size = len(val_dataset)
+    
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     # 모델, 손실 함수, 최적화 기법 설정
     model = PilotNet(in_channels=6).to(device)
-    criterion = nn.MSELoss() # 예측값과 실제값의 차이를 계산 (평균제곱오차)
+    mse_loss = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    print(f"총 {len(combined_dataset)}개의 데이터로 학습을 시작합니다...")
+    print(f"학습 데이터 {train_size}개, 검증 데이터 {val_size}개로 학습을 시작합니다...")
+
+    best_val_loss = float('inf')
+    best_model_path = f'/home/ace/fsds_dataset/pretrained_model/pilotnet_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth'
 
     for epoch in range(EPOCHS):
         model.train()
         running_loss = 0.0
         
-        for i, (images, targets) in enumerate(dataloader):
+        for i, (images, targets) in enumerate(train_loader):
             images, targets = images.to(device), targets.to(device)
 
             # 1. Forward Pass (예측)
             optimizer.zero_grad()
             outputs = model(images)
             
-            # 2. Loss 계산
-            loss = criterion(outputs, targets)
+            # 2. Loss 계산 (조향과 속도 가중치 분리)
+            loss_steer = mse_loss(outputs[:, 0], targets[:, 0])
+            loss_speed = mse_loss(outputs[:, 1], targets[:, 1])
+            loss = (0.8 * loss_steer) + (0.2 * loss_speed)
             
             # 3. Backward Pass (역전파 및 가중치 업데이트)
             loss.backward()
@@ -295,14 +327,31 @@ def main():
 
             running_loss += loss.item()
 
-        # 에포크마다 평균 Loss 출력
-        avg_loss = running_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{EPOCHS}], Loss: {avg_loss:.4f}")
+        # 검증(Validation) 페이즈
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, targets in val_loader:
+                images, targets = images.to(device), targets.to(device)
+                outputs = model(images)
+                
+                v_loss_steer = mse_loss(outputs[:, 0], targets[:, 0])
+                v_loss_speed = mse_loss(outputs[:, 1], targets[:, 1])
+                v_loss = (0.8 * v_loss_steer) + (0.2 * v_loss_speed)
+                val_loss += v_loss.item()
 
-    # 학습된 모델 가중치 저장
-    save_path = f'/home/ace/fsds_dataset/pretrained_model/pilotnet_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth'
-    torch.save(model.state_dict(), save_path)
-    print(f"\n학습 완료! 모델이 성공적으로 저장되었습니다: {save_path}")
+        avg_train_loss = running_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+        
+        print(f"Epoch [{epoch+1}/{EPOCHS}], Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+
+        # Best Model 저장
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  --> Best Model 저장됨! (Val Loss: {best_val_loss:.4f})")
+
+    print(f"\n학습 완료! 최종 Best 모델 경로: {best_model_path}")
 
 if __name__ == '__main__':
     main()

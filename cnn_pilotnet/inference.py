@@ -85,10 +85,15 @@ class PilotNet(nn.Module):
         )
         self.classifier = nn.Sequential(
             nn.Linear(1152, 100),
+            nn.BatchNorm1d(100),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
             nn.Linear(100, 50),
+            nn.BatchNorm1d(50),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
             nn.Linear(50, 10),
+            nn.BatchNorm1d(10),
             nn.ReLU(inplace=True),
             nn.Linear(10, 2),  # Steering, Speed(정규화)
         )
@@ -146,7 +151,7 @@ class E2EInferenceNode(Node):
         self.model = PilotNet(in_channels=6).to(self.device)
         
         # 저장된 가중치 불러오기
-        model_path = '/home/ace/fsds_dataset/pretrained_model/pilotnet_model_20260313_210532.pth'
+        model_path = '/home/ace/fsds_dataset/pretrained_model/pilotnet_model_20260520_223740.pth'
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval() # 평가(추론) 모드로 전환
         self.get_logger().info(f"모델 로드 완료: {model_path} ({self.device})")
